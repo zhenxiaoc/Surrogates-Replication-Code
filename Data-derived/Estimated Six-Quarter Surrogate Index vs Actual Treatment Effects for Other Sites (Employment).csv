@@ -1,0 +1,5 @@
+site,surrogate_index_rs_q6,experimental_rs_q6,experimental_rs_q6_se,surrogate_index_la_q6,experimental_la_q6,experimental_la_q6_se,surrogate_index_sd_q6,experimental_sd_q6,experimental_sd_q6_se,surrogate_index_al_q6,experimental_al_q6,experimental_al_q6_se,upper_experimental_rs_q6,lower_experimental_rs_q6,upper_experimental_la_q6,lower_experimental_la_q6,upper_experimental_sd_q6,lower_experimental_sd_q6,upper_experimental_al_q6,lower_experimental_al_q6
+RS,0.07482348319334549,0.062003890034059005,0.010594209252404934,,,,,,,,,,0.09559237015091743,0.05405459623577355,,,,,,
+LA,,,,-0.007488095914423493,0.01310756004683612,0.009224532754647017,,,,,,,,,0.010596638763570972,-0.025572830592417956,,,,
+SD,,,,,,,0.00865098314324624,-0.008844880170018487,0.010156839457332567,,,,,,,,0.02856098679747874,-0.011259020510986257,,
+AL,,,,,,,,,,0.0010667598603578494,0.026909831796133505,0.016567327671634945,,,,,,,0.033571019499159784,-0.03143749977844409

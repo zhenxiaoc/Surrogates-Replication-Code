@@ -5,7 +5,7 @@ This code replicates the application to the GAIN job training program in
 The code can be run directly from **_Surrogates Metafile.do_** by setting the global ${surrogates} to point to  this repository. 
 If running on  MacOS or Linux, change the figure output extension from "wmf" to "png" in "Surrogates Metafile.do".
 
-Alternatively, each file in the folder **_Code_** can be run individually. 
+Alternatively, each file in the folder **_Code_** can be run individually. Note: the original Stata replication scripts are archived under `legacy-stata/` in this repository; the Python implementation under `Code/python/` is the recommended entrypoint for reproducing the analysis. 
 The main .do file is **_Estimate treatment effects.do_**, which is contained in **_Code/Compute Estimates_**. 
 When the files are run individually, this file should be run first. 
 The other .do files use output from this file to produce figures, tables and scalars that appear in the text. 

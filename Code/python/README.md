@@ -3,6 +3,8 @@
 This folder mirrors the Stata workflow with Python scripts that produce the same
 CSV outputs and figures. The scripts are organized by responsibility:
 
+> Note: The original Stata replication scripts have been archived into `legacy-stata/` in the repository; this Python folder is the recommended and actively maintained workflow.
+
 - `config.py` – shared paths, dataset selection, and output configuration.
 - `compute_estimates.py` – main estimation workflow (Sections A–E of
   `Estimate treatment effects.do`).
