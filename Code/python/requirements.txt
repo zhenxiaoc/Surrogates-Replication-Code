@@ -1,0 +1,7 @@
+# Optional copy for local convenience
+pandas==2.2.2
+numpy==1.26.4
+statsmodels==0.14.2
+matplotlib==3.9.2
+openpyxl==3.1.5
+pytest==7.4.4
