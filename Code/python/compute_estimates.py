@@ -13,34 +13,50 @@ from regression import fit_ols, predict_ols
 
 
 def cumulative_means(df: pd.DataFrame, outcomes: Iterable[str], max_quarter: int = 36) -> pd.DataFrame:
+    # Batch-create cumulative-mean columns to avoid repeated single-column inserts
+    new_cols: dict[str, pd.Series] = {}
     for outcome in outcomes:
         for q in range(1, max_quarter + 1):
             cols = outcome_columns(outcome, range(1, q + 1))
-            df[f"{outcome}_cm{q}"] = df[cols].sum(axis=1) / q
+            new_cols[f"{outcome}_cm{q}"] = df[cols].sum(axis=1) / q
+
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
 
 
-def add_estimate_columns(df: pd.DataFrame, outcomes: Iterable[str]) -> None:
+def add_estimate_columns(df: pd.DataFrame, outcomes: Iterable[str]) -> pd.DataFrame:
+    # Create estimate and se columns in bulk to avoid fragmentation
+    new_cols: dict[str, pd.Series] = {}
     for estimate in ["experimental", "surrogate_index", "naive", "single_surrogate"]:
         for outcome in outcomes:
-            df[f"{estimate}_{outcome}"] = np.nan
-            df[f"{estimate}_se_{outcome}"] = np.nan
+            new_cols[f"{estimate}_{outcome}"] = np.nan
+            new_cols[f"{estimate}_se_{outcome}"] = np.nan
+
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    return df
 
 
 def _t_crit(n: int) -> float:
     return float(t.ppf(0.975, df=n - 2))
 
 
-def compute_section_b(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> pd.DataFrame:
+def compute_section_b(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     results = pd.DataFrame({"quarter": np.arange(1, 37)})
     var_treatment = df["treatment"].var(ddof=1)
     t_crit = _t_crit(n_obs)
 
+    # Collect new prediction columns per outcome and add them in bulk
+    all_new_cols: dict[str, pd.Series] = {}
+
     for outcome in outcomes:
+        outcome_new: dict[str, pd.Series] = {}
+        treated = df[df["treatment"] == 1]
+
         for q in range(1, 37):
             outcome_q_cols = outcome_columns(outcome, range(1, q + 1))
 
-            treated = df[df["treatment"] == 1]
             model_surrogate = fit_ols(treated, f"{outcome}_cm36", outcome_q_cols)
 
             for i, col in enumerate(outcome_q_cols, start=1):
@@ -50,8 +66,14 @@ def compute_section_b(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> 
             results.loc[q - 1, f"{outcome}_constant"] = model_surrogate.coef("const")
             results.loc[q - 1, f"{outcome}_constant_se"] = model_surrogate.se("const")
 
-            df[f"{outcome}_cm_pred{q}"] = predict_ols(df, outcome_q_cols, model_surrogate.params)
-            model_surrogate_te = fit_ols(df, f"{outcome}_cm_pred{q}", ["treatment"])
+            # Store predictions to add them in bulk later and use a temporary
+            # dataframe for the treatment regression so we do not require the
+            # predicted column to be present in df yet.
+            pred_series = predict_ols(df, outcome_q_cols, model_surrogate.params)
+            outcome_new[f"{outcome}_cm_pred{q}"] = pred_series
+
+            tmp = pd.DataFrame({f"{outcome}_cm_pred{q}": pred_series, "treatment": df["treatment"]})
+            model_surrogate_te = fit_ols(tmp, f"{outcome}_cm_pred{q}", ["treatment"])
             results.loc[q - 1, f"surrogate_index_{outcome}"] = model_surrogate_te.coef("treatment")
             results.loc[q - 1, f"surrogate_index_se_{outcome}"] = model_surrogate_te.se("treatment")
 
@@ -63,8 +85,10 @@ def compute_section_b(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> 
             results.loc[q - 1, f"bias_05_{outcome}"] = np.sqrt(bias_base * 0.05)
 
             model_single = fit_ols(treated, f"{outcome}_cm36", [f"{outcome}{q}"])
-            df[f"{outcome}_cm_1_pred{q}"] = predict_ols(df, [f"{outcome}{q}"], model_single.params)
-            model_single_te = fit_ols(df, f"{outcome}_cm_1_pred{q}", ["treatment"])
+            pred1 = predict_ols(df, [f"{outcome}{q}"], model_single.params)
+            outcome_new[f"{outcome}_cm_1_pred{q}"] = pred1
+            tmp1 = pd.DataFrame({f"{outcome}_cm_1_pred{q}": pred1, "treatment": df["treatment"]})
+            model_single_te = fit_ols(tmp1, f"{outcome}_cm_1_pred{q}", ["treatment"])
             results.loc[q - 1, f"single_surrogate_{outcome}"] = model_single_te.coef("treatment")
             results.loc[q - 1, f"single_surrogate_se_{outcome}"] = model_single_te.se("treatment")
 
@@ -76,6 +100,7 @@ def compute_section_b(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> 
             results.loc[q - 1, f"experimental_{outcome}"] = model_experimental.coef("treatment")
             results.loc[q - 1, f"experimental_se_{outcome}"] = model_experimental.se("treatment")
 
+        # compute upper/lower for this outcome
         for estimate in ["experimental", "surrogate_index", "naive"]:
             results[f"upper_{estimate}_{outcome}"] = (
                 results[f"{estimate}_{outcome}"] + t_crit * results[f"{estimate}_se_{outcome}"]
@@ -84,12 +109,23 @@ def compute_section_b(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> 
                 results[f"{estimate}_{outcome}"] - t_crit * results[f"{estimate}_se_{outcome}"]
             )
 
-    return results
+        all_new_cols.update(outcome_new)
+
+    if all_new_cols:
+        df = pd.concat([df, pd.DataFrame(all_new_cols, index=df.index)], axis=1)
+
+    return results, df
 
 
 def output_section_b(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int, data_derived: str) -> None:
     t_crit = _t_crit(n_obs)
     for outcome in outcomes:
+        # Ensure expected columns exist in results; if not, create them as NaN so
+        # downstream code and figures are robust to small differences in data
+        for col in [f"single_surrogate_{outcome}", f"single_surrogate_se_{outcome}"]:
+            if col not in results.columns:
+                results[col] = np.nan
+
         columns = [
             "quarter",
             f"experimental_{outcome}",
@@ -98,6 +134,8 @@ def output_section_b(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int,
             f"surrogate_index_se_{outcome}",
             f"naive_{outcome}",
             f"naive_se_{outcome}",
+            f"single_surrogate_{outcome}",
+            f"single_surrogate_se_{outcome}",
         ]
         subset = results[columns].copy()
         for estimate in ["experimental", "surrogate_index", "naive"]:
@@ -142,22 +180,30 @@ def output_section_b(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int,
     results.to_csv(f"{data_derived}/Unformatted Appendix Tables Output.csv", index=False)
 
 
-def compute_section_c(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> pd.DataFrame:
+def compute_section_c(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     results = pd.DataFrame({"quarter": np.arange(1, 37)})
+    all_new_cols: dict[str, pd.Series] = {}
     for outcome in outcomes:
+        outcome_new: dict[str, pd.Series] = {}
         for q in range(6, 37):
             treated = df[df["treatment"] == 1]
             model_surrogate = fit_ols(treated, f"{outcome}_cm{q}", outcome_columns(outcome, range(1, 7)))
-            df[f"{outcome}_cm_pred{q}"] = predict_ols(df, outcome_columns(outcome, range(1, 7)), model_surrogate.params)
-            model_surrogate_te = fit_ols(df, f"{outcome}_cm_pred{q}", ["treatment"])
+            pred_series = predict_ols(df, outcome_columns(outcome, range(1, 7)), model_surrogate.params)
+            outcome_new[f"{outcome}_cm_pred{q}"] = pred_series
+            tmp = pd.DataFrame({f"{outcome}_cm_pred{q}": pred_series, "treatment": df["treatment"]})
+            model_surrogate_te = fit_ols(tmp, f"{outcome}_cm_pred{q}", ["treatment"])
             results.loc[q - 1, f"surrogate_index_{outcome}"] = model_surrogate_te.coef("treatment")
             results.loc[q - 1, f"surrogate_index_se_{outcome}"] = model_surrogate_te.se("treatment")
 
             model_experimental = fit_ols(df, f"{outcome}_cm{q}", ["treatment"])
             results.loc[q - 1, f"experimental_{outcome}"] = model_experimental.coef("treatment")
             results.loc[q - 1, f"experimental_se_{outcome}"] = model_experimental.se("treatment")
+        all_new_cols.update(outcome_new)
 
-    return results
+    if all_new_cols:
+        df = pd.concat([df, pd.DataFrame(all_new_cols, index=df.index)], axis=1)
+
+    return results, df
 
 
 def output_section_c(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int, data_derived: str) -> None:
@@ -177,28 +223,58 @@ def output_section_c(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int,
         subset.to_csv(f"{data_derived}/{filename}", index=False)
 
 
-def compute_section_d(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> pd.DataFrame:
+def compute_section_d(df: pd.DataFrame, outcomes: Iterable[str], n_obs: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     results = pd.DataFrame({"year": np.arange(1, 10)})
 
+    all_new_cols: dict[str, pd.Series] = {}
     for outcome in outcomes:
+        # create annual outcome columns in batch
+        annual_new: dict[str, pd.Series] = {}
         for y in range(3, 10):
             year_start = 4 * y - 3
             year_end = 4 * y
             cols = outcome_columns(outcome, range(year_start, year_end + 1))
-            df[f"{outcome}_annual_{y}"] = df[cols].sum(axis=1) / 4
+            annual_new[f"{outcome}_annual_{y}"] = df[cols].sum(axis=1) / 4
+        all_new_cols.update(annual_new)
 
+        # compute predictions based on first 6 quarters and store pred columns
+        pred_new: dict[str, pd.Series] = {}
         for y in range(3, 10):
-            treated = df[df["treatment"] == 1]
-            model_surrogate = fit_ols(treated, f"{outcome}_annual_{y}", outcome_columns(outcome, range(1, 7)))
-            df[f"{outcome}_annual_pred{y}"] = predict_ols(df, outcome_columns(outcome, range(1, 7)), model_surrogate.params)
-            model_surrogate_te = fit_ols(df, f"{outcome}_annual_pred{y}", ["treatment"])
+            # compute annual outcome as a Series (not yet assigned to df)
+            year_start = 4 * y - 3
+            year_end = 4 * y
+            cols = outcome_columns(outcome, range(year_start, year_end + 1))
+            annual_series = df[cols].sum(axis=1) / 4
+
+            # Fit surrogate model using treated observations only, on a temporary
+            # dataframe that includes the annual outcome and first-6-quarter predictors.
+            df_surrogate = pd.concat(
+                [annual_series.rename(f"{outcome}_annual_{y}"), df[outcome_columns(outcome, range(1, 7))], df["treatment"]],
+                axis=1,
+            )
+            treated_surrogate = df_surrogate[df_surrogate["treatment"] == 1]
+            model_surrogate = fit_ols(treated_surrogate, f"{outcome}_annual_{y}", outcome_columns(outcome, range(1, 7)))
+
+            pred_series = predict_ols(df, outcome_columns(outcome, range(1, 7)), model_surrogate.params)
+            pred_new[f"{outcome}_annual_pred{y}"] = pred_series
+
+            tmp = pd.DataFrame({f"{outcome}_annual_pred{y}": pred_series, "treatment": df["treatment"]})
+            model_surrogate_te = fit_ols(tmp, f"{outcome}_annual_pred{y}", ["treatment"])
             results.loc[y - 1, f"surrogate_index_{outcome}"] = model_surrogate_te.coef("treatment")
 
-            model_experimental = fit_ols(df, f"{outcome}_annual_{y}", ["treatment"])
+            model_experimental = fit_ols(
+                pd.DataFrame({f"{outcome}_annual_{y}": annual_series, "treatment": df["treatment"]}).dropna(),
+                f"{outcome}_annual_{y}",
+                ["treatment"],
+            )
             results.loc[y - 1, f"experimental_{outcome}"] = model_experimental.coef("treatment")
             results.loc[y - 1, f"experimental_se_{outcome}"] = model_experimental.se("treatment")
+        all_new_cols.update(pred_new)
 
-    return results
+    if all_new_cols:
+        df = pd.concat([df, pd.DataFrame(all_new_cols, index=df.index)], axis=1)
+
+    return results, df
 
 
 def output_section_d(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int, data_derived: str) -> None:
@@ -218,7 +294,7 @@ def output_section_d(results: pd.DataFrame, outcomes: Iterable[str], n_obs: int,
         subset.to_csv(f"{data_derived}/{filename}", index=False)
 
 
-def compute_section_e(df: pd.DataFrame, outcomes: Iterable[str]) -> pd.DataFrame:
+def compute_section_e(df: pd.DataFrame, outcomes: Iterable[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df.copy()
     df["site"] = df["site"].replace(
         {
@@ -230,8 +306,13 @@ def compute_section_e(df: pd.DataFrame, outcomes: Iterable[str]) -> pd.DataFrame
     )
     sites = ["RS", "LA", "SD", "AL"]
 
+    # compute cm36 for outcomes in batch
+    new_cols: dict[str, pd.Series] = {}
     for outcome in outcomes:
-        df[f"{outcome}_cm36"] = df[outcome_columns(outcome, range(1, 37))].sum(axis=1) / 36
+        new_cols[f"{outcome}_cm36"] = df[outcome_columns(outcome, range(1, 37))].sum(axis=1) / 36
+
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
     results = pd.DataFrame({"site": sites})
     for site in sites:
@@ -244,28 +325,30 @@ def compute_section_e(df: pd.DataFrame, outcomes: Iterable[str]) -> pd.DataFrame
         for site in sites:
             site_df = df[df["site"] == site]
             model_surrogate_te = fit_ols(site_df, f"{outcome}_cm_predQ6", ["treatment"])
-            results.loc[results["site"] == site, f"surrogate_index_{outcome}_{site}_Q6"] = model_surrogate_te.coef("treatment")
+            results.loc[results["site"] == site, f"surrogate_index_{outcome}_{site}_q6"] = model_surrogate_te.coef("treatment")
 
             model_experimental = fit_ols(site_df, f"{outcome}_cm36", ["treatment"])
-            results.loc[results["site"] == site, f"experimental_{outcome}_{site}_Q6"] = model_experimental.coef("treatment")
-            results.loc[results["site"] == site, f"experimental_{outcome}_{site}_Q6_se"] = model_experimental.se("treatment")
+            results.loc[results["site"] == site, f"experimental_{outcome}_{site}_q6"] = model_experimental.coef("treatment")
+            results.loc[results["site"] == site, f"experimental_{outcome}_{site}_q6_se"] = model_experimental.se("treatment")
 
-    return results
+    return results, df
 
 
 def output_section_e(results: pd.DataFrame, outcomes: Iterable[str], data_derived: str) -> None:
     for outcome in outcomes:
         subset = results[[col for col in results.columns if f"_{outcome}_" in col or col in {"site", "site_n_obs"}]].copy()
-        subset.columns = [col.replace(f"_{outcome}_", "_") for col in subset.columns]
+        # normalize columns by removing the outcome segment and lowercasing
+        subset.columns = [col.replace(f"_{outcome}_", "_").lower() for col in subset.columns]
         subset = subset.set_index("site")
 
         for site in subset.index:
             n_obs = int(subset.loc[site, "site_n_obs"])
             t_crit = _t_crit(n_obs) if n_obs > 2 else 0
-            upper = subset.loc[site, f"surrogate_index_{site}_Q6"] + t_crit * subset.loc[site, f"experimental_{site}_Q6_se"]
-            lower = subset.loc[site, f"surrogate_index_{site}_Q6"] - t_crit * subset.loc[site, f"experimental_{site}_Q6_se"]
-            subset.loc[site, f"upper_experimental_{site}_Q6"] = upper
-            subset.loc[site, f"lower_experimental_{site}_Q6"] = lower
+            site_lower = site.lower()
+            upper = subset.loc[site, f"surrogate_index_{site_lower}_q6"] + t_crit * subset.loc[site, f"experimental_{site_lower}_q6_se"]
+            lower = subset.loc[site, f"surrogate_index_{site_lower}_q6"] - t_crit * subset.loc[site, f"experimental_{site_lower}_q6_se"]
+            subset.loc[site, f"upper_experimental_{site_lower}_q6"] = upper
+            subset.loc[site, f"lower_experimental_{site_lower}_q6"] = lower
 
         subset = subset.reset_index().drop(columns=["site_n_obs"])
         filename = (
@@ -289,23 +372,23 @@ def main() -> None:
     outcomes = available_outcomes(riverside, data_type)
 
     riverside = cumulative_means(riverside, outcomes)
-    add_estimate_columns(riverside, outcomes)
+    riverside = add_estimate_columns(riverside, outcomes)
 
     n_obs = len(riverside)
-    section_b_results = compute_section_b(riverside, outcomes, n_obs)
+    section_b_results, riverside = compute_section_b(riverside, outcomes, n_obs)
     output_section_b(section_b_results, outcomes, n_obs, str(paths.data_derived))
 
-    section_c_results = compute_section_c(riverside, outcomes, n_obs)
+    section_c_results, riverside = compute_section_c(riverside, outcomes, n_obs)
     output_section_c(section_c_results, outcomes, n_obs, str(paths.data_derived))
 
-    section_d_results = compute_section_d(riverside, outcomes, n_obs)
+    section_d_results, riverside = compute_section_d(riverside, outcomes, n_obs)
     output_section_d(section_d_results, outcomes, n_obs, str(paths.data_derived))
 
     all_locations_path = paths.data_raw / f"{data_type} All Locations GAIN data.dta"
     if all_locations_path.exists():
         all_locations = read_stata(all_locations_path)
         outcomes_all = available_outcomes(all_locations, data_type)
-        section_e_results = compute_section_e(all_locations, outcomes_all)
+        section_e_results, all_locations = compute_section_e(all_locations, outcomes_all)
         output_section_e(section_e_results, outcomes_all, str(paths.data_derived))
 
 

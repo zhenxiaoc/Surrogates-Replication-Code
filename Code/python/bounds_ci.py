@@ -10,34 +10,83 @@ from data import available_outcomes, outcome_columns, read_stata
 from regression import fit_ols, predict_ols
 
 
+def _ols_params_and_r2(y: np.ndarray, X: np.ndarray) -> tuple[np.ndarray, float]:
+    """Fast OLS via numpy returning params (including intercept) and R^2.
+
+    X can be 1-D or 2-D array of predictors. Returns beta vector (p+1,) and r2.
+    """
+    if X.ndim == 1:
+        X_design = np.column_stack((np.ones_like(X), X))
+    else:
+        X_design = np.column_stack((np.ones(X.shape[0]), X))
+
+    beta, *_ = np.linalg.lstsq(X_design, y, rcond=None)
+    y_hat = X_design @ beta
+    ss_res = np.sum((y - y_hat) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
+    return beta, float(r2)
+
+
 def bootstrap_bounds(df: pd.DataFrame, outcomes: list[str], reps: int, seed: int) -> dict[str, dict[str, np.ndarray]]:
+    """Numpy-optimized bootstrap for bounds on bias.
+
+    This avoids assigning new columns to DataFrames inside loops and uses
+    least-squares via numpy for speed.
+    """
     rng = np.random.default_rng(seed)
+    n = len(df)
     results: dict[str, dict[str, np.ndarray]] = {}
 
+    # Pre-extract numeric arrays for each outcome to avoid repeated DataFrame access
+    outcome_data: dict[str, dict[str, np.ndarray]] = {}
+    treatment_full = df["treatment"].to_numpy()
+
     for outcome in outcomes:
-        results[outcome] = {
-            "estimate": np.zeros((36, reps)),
-            "bias": np.zeros((36, reps)),
-        }
+        cols = [f"{outcome}{i}" for i in range(1, 37)]
+        arr = df[cols].to_numpy(dtype=float)  # shape (n, 36)
+        y_cm36 = df[[f"{outcome}_cm36"]].to_numpy(dtype=float).reshape(-1)
+        outcome_data[outcome] = {"arr": arr, "y_cm36": y_cm36}
+
+        results[outcome] = {"estimate": np.zeros((36, reps)), "bias": np.zeros((36, reps))}
 
     for rep in range(reps):
-        sample = df.sample(n=len(df), replace=True, random_state=int(rng.integers(0, 1_000_000)))
-        var_treatment = sample["treatment"].var(ddof=1)
+        # sample indices with replacement
+        idx = rng.integers(0, n, size=n)
+        sample_treatment = treatment_full[idx]
+        var_treatment = np.var(sample_treatment, ddof=1)
 
         for outcome in outcomes:
-            for q in range(1, 37):
-                outcome_q_cols = outcome_columns(outcome, range(1, q + 1))
-                treated = sample[sample["treatment"] == 1]
-                model_surrogate = fit_ols(treated, f"{outcome}_cm36", outcome_q_cols)
-                sample[f"{outcome}_cm_pred{q}"] = predict_ols(sample, outcome_q_cols, model_surrogate.params)
-                model_surrogate_te = fit_ols(sample, f"{outcome}_cm_pred{q}", ["treatment"])
-                results[outcome]["estimate"][q - 1, rep] = model_surrogate_te.coef("treatment")
+            arr = outcome_data[outcome]["arr"][idx, :]
+            y_cm36_sample = outcome_data[outcome]["y_cm36"][idx]
 
-                model_treatment = fit_ols(sample, "treatment", outcome_q_cols)
-                model_outcome = fit_ols(sample, f"{outcome}_cm36", outcome_q_cols)
-                var_outcome = sample[f"{outcome}_cm36"].var(ddof=1)
-                bias_base = var_outcome * (1 - model_treatment.r2) * (1 - model_outcome.r2) / var_treatment
-                results[outcome]["bias"][q - 1, rep] = np.sqrt(bias_base * 0.01)
+            for q in range(1, 37):
+                X_q = arr[:, :q]
+
+                # Fit surrogate model on treated sample
+                treated_mask = sample_treatment == 1
+                if treated_mask.sum() == 0:
+                    results[outcome]["estimate"][q - 1, rep] = np.nan
+                    results[outcome]["bias"][q - 1, rep] = np.nan
+                    continue
+
+                beta_s, _ = _ols_params_and_r2(y_cm36_sample[treated_mask], X_q[treated_mask])
+
+                # Predict on full sample and regress predicted on treatment
+                if X_q.ndim == 1 or X_q.shape[1] == 1:
+                    X_design = np.column_stack((np.ones(X_q.shape[0]), X_q.reshape(-1)))
+                else:
+                    X_design = np.column_stack((np.ones(X_q.shape[0]), X_q))
+                preds = X_design @ beta_s
+
+                beta_pred, _ = _ols_params_and_r2(preds, sample_treatment)
+                results[outcome]["estimate"][q - 1, rep] = float(beta_pred[1])
+
+                _, r2_treatment = _ols_params_and_r2(sample_treatment, X_q)
+                _, r2_outcome = _ols_params_and_r2(y_cm36_sample, X_q)
+                var_outcome = np.var(y_cm36_sample, ddof=1)
+                bias_base = var_outcome * (1 - r2_treatment) * (1 - r2_outcome) / var_treatment if var_treatment != 0 else np.nan
+                results[outcome]["bias"][q - 1, rep] = np.sqrt(bias_base * 0.01) if bias_base >= 0 else 0.0
 
     return results
 
@@ -46,20 +95,41 @@ def compute_point_estimates(df: pd.DataFrame, outcomes: list[str]) -> pd.DataFra
     results = pd.DataFrame({"quarter": np.arange(1, 37)})
     var_treatment = df["treatment"].var(ddof=1)
 
-    for outcome in outcomes:
-        for q in range(1, 37):
-            outcome_q_cols = outcome_columns(outcome, range(1, q + 1))
-            treated = df[df["treatment"] == 1]
-            model_surrogate = fit_ols(treated, f"{outcome}_cm36", outcome_q_cols)
-            df[f"{outcome}_cm_pred{q}"] = predict_ols(df, outcome_q_cols, model_surrogate.params)
-            model_surrogate_te = fit_ols(df, f"{outcome}_cm_pred{q}", ["treatment"])
-            results.loc[q - 1, f"estimate_{outcome}"] = model_surrogate_te.coef("treatment")
+    n = len(df)
+    treatment_full = df["treatment"].to_numpy()
 
-            model_treatment = fit_ols(df, "treatment", outcome_q_cols)
-            model_outcome = fit_ols(df, f"{outcome}_cm36", outcome_q_cols)
-            var_outcome = df[f"{outcome}_cm36"].var(ddof=1)
-            bias_base = var_outcome * (1 - model_treatment.r2) * (1 - model_outcome.r2) / var_treatment
-            results.loc[q - 1, f"bias_01_{outcome}"] = np.sqrt(bias_base * 0.01)
+    for outcome in outcomes:
+        cols = [f"{outcome}{i}" for i in range(1, 37)]
+        arr = df[cols].to_numpy(dtype=float)
+        y_cm36 = df[[f"{outcome}_cm36"]].to_numpy(dtype=float).reshape(-1)
+
+        for q in range(1, 37):
+            X_q = arr[:, :q]
+
+            # Fit surrogate on treated observations only
+            treated_mask = treatment_full == 1
+            if treated_mask.sum() == 0:
+                results.loc[q - 1, f"estimate_{outcome}"] = np.nan
+                results.loc[q - 1, f"bias_01_{outcome}"] = np.nan
+                continue
+
+            beta_s, _ = _ols_params_and_r2(y_cm36[treated_mask], X_q[treated_mask])
+
+            # predict on full sample
+            if X_q.ndim == 1 or X_q.shape[1] == 1:
+                X_design = np.column_stack((np.ones(X_q.shape[0]), X_q.reshape(-1)))
+            else:
+                X_design = np.column_stack((np.ones(X_q.shape[0]), X_q))
+            preds = X_design @ beta_s
+
+            beta_pred, _ = _ols_params_and_r2(preds, treatment_full)
+            results.loc[q - 1, f"estimate_{outcome}"] = float(beta_pred[1])
+
+            _, r2_treatment = _ols_params_and_r2(treatment_full, X_q)
+            _, r2_outcome = _ols_params_and_r2(y_cm36, X_q)
+            var_outcome = np.var(y_cm36, ddof=1)
+            bias_base = var_outcome * (1 - r2_treatment) * (1 - r2_outcome) / var_treatment if var_treatment != 0 else np.nan
+            results.loc[q - 1, f"bias_01_{outcome}"] = np.sqrt(bias_base * 0.01) if bias_base >= 0 else 0.0
 
     return results
 
